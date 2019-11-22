@@ -21,11 +21,21 @@ from __future__ import print_function
 import os
 import modeling
 import optimization
+import optimization_gpu
 import tensorflow as tf
+
+from tensorflow.python.estimator.run_config import RunConfig
+from tensorflow.python.estimator.estimator import Estimator
+from tensorflow.python.distribute.cross_device_ops import AllReduceCrossDeviceOps
+
 
 flags = tf.flags
 
 FLAGS = flags.FLAGS
+
+flags.DEFINE_integer(
+    "n_gpus", 4,
+    "GPU number")
 
 ## Required parameters
 flags.DEFINE_string(
@@ -57,11 +67,11 @@ flags.DEFINE_integer(
     "Maximum number of masked LM predictions per sequence. "
     "Must match data generation.")
 
-flags.DEFINE_bool("do_train", False, "Whether to run training.")
+flags.DEFINE_bool("do_train", True, "Whether to run training.")
 
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
 
-flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
+flags.DEFINE_integer("train_batch_size", 128, "Total batch size for training.")
 
 flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
 
@@ -105,6 +115,7 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 6, 7'
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -175,14 +186,14 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+      train_op = optimization_gpu.create_optimizer(
+          total_loss, learning_rate, num_train_steps, num_warmup_steps)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op,
-          scaffold_fn=scaffold_fn)
+          scaffold=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.EVAL:
 
       def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
@@ -335,7 +346,7 @@ def input_fn_builder(input_files,
 
   def input_fn(params):
     """The actual input function."""
-    batch_size = params["batch_size"]
+    batch_size = FLAGS.train_batch_size
 
     name_to_features = {
         "input_ids":
@@ -434,17 +445,22 @@ def main(_):
   print("###tpu_cluster_resolver:",tpu_cluster_resolver,";FLAGS.use_tpu:",FLAGS.use_tpu,";FLAGS.tpu_name:",FLAGS.tpu_name,";FLAGS.tpu_zone:",FLAGS.tpu_zone)
   # ###tpu_cluster_resolver: <tensorflow.python.distribute.cluster_resolver.tpu_cluster_resolver.TPUClusterResolver object at 0x7f4b387b06a0> ;FLAGS.use_tpu: True ;FLAGS.tpu_name: grpc://10.240.1.83:8470
 
+  dist_strategy = tf.contrib.distribute.MirroredStrategy(
+      num_gpus=FLAGS.n_gpus,
+      cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.n_gpus),
+      # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
+  )
+
   is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      keep_checkpoint_max=20, # 10
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
+
+  log_every_n_steps = 20
+
+  run_config = RunConfig(
+      train_distribute=dist_strategy,
+      eval_distribute=dist_strategy,
+      log_step_count_steps=log_every_n_steps,
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+      save_checkpoints_steps=FLAGS.save_checkpoints_steps)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -457,12 +473,10 @@ def main(_):
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
+  estimator = Estimator(
       model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size)
+      params={},
+      config=run_config)
 
   if FLAGS.do_train:
     tf.logging.info("***** Running training *****")
